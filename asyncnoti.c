@@ -31,6 +31,7 @@ struct keyirq_device_struct {
         int major;
         int minor;
         dev_t devid;
+        atomic_t release_key;
         struct cdev keyirq_cdev;
         struct class *class;
         struct device *device;
@@ -38,12 +39,13 @@ struct keyirq_device_struct {
         struct irq_keydesc keyirq[KEY_NUM];
         struct timer_list timer;
         struct fasync_struct *fasync_list;
+        wait_queue_head_t r_wait;
 };
 static struct keyirq_device_struct keyirq_dev;
 
 static int keyirq_open(struct inode *inode, struct file *file);
-static ssize_t keyirq_write(struct file *file,
-                        const char __user *user,
+static ssize_t keyirq_read(struct file *file,
+                        char __user *user,
                         size_t count,
                         loff_t *loff);
 static int keyirq_fasync(int fd, struct file *filp, int on);
@@ -52,7 +54,7 @@ static int keyirq_release(struct inode *inode, struct file *file);
 static struct file_operations ops = {
         .owner = THIS_MODULE,
         .open = keyirq_open,
-        .write = keyirq_write,
+        .read = keyirq_read,
         .fasync = keyirq_fasync,
         .release = keyirq_release,
 };
@@ -63,20 +65,38 @@ static int keyirq_open(struct inode *inode, struct file *file)
         return 0;
 }
 
-static ssize_t keyirq_write(struct file *file,
-                        const char __user *user,
+static ssize_t keyirq_read(struct file *file,
+                        char __user *user,
                         size_t count,
                         loff_t *loff)
 {
         int ret = 0;
-        unsigned char buf[1] = {0};
+        int releasekey = 0;
         struct keyirq_device_struct *dev = file->private_data;
 
-        ret = copy_from_user(buf, user, 1);
-        if (ret != 0) {
-                goto error;
+        if (file->f_flags & O_NONBLOCK) {
+                if (atomic_read(&dev->release_key))
+                        return -EBUSY;
+        } else {
+#if 0
+                ret = wait_event_interruptible(dev->r_wait, atomic_read(&dev->release_key));
+                if (ret) {
+                        printk("wait event inerruptibale error!\n");
+                        goto error;
+                }
+#endif
         }
 
+        releasekey = atomic_read(&dev->release_key);
+        if (releasekey) {
+                atomic_set(&dev->release_key, 0);
+                ret = copy_to_user(user, &releasekey, sizeof(releasekey));
+                if (ret) {
+                        printk("copy to user error!\n");
+                        goto error;
+                }
+                ret = sizeof(dev->release_key);
+        }
 error:
         return ret;
 }
@@ -90,9 +110,8 @@ static int keyirq_fasync(int fd, struct file *filp, int on)
 
 static int keyirq_release(struct inode *inode, struct file *file)
 {
-        file->private_data = NULL;
-
         keyirq_fasync(-1, file, 0);
+        file->private_data = NULL;
 
         return 0;
 }
@@ -104,6 +123,7 @@ void timer_func(unsigned long arg)
 
         value = gpio_get_value(dev->keyirq[0].gpio);
         if (value == 0) {
+                atomic_set(&dev->release_key, 1);
                 printk("KEY0 Press!\n");
         } else if (value == 1) {
                 printk("KEY0 Release!\n");
@@ -243,6 +263,9 @@ static int __init keyirq_init(void)
                 ret = -EINVAL;
                 goto fail_device_create;
         }
+
+        atomic_set(&keyirq_dev.release_key, 0);
+        init_waitqueue_head(&keyirq_dev.r_wait);
 
         init_timer(&keyirq_dev.timer);
         keyirq_dev.timer.function = timer_func;
